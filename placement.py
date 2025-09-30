@@ -250,7 +250,7 @@ def generate_placement_input(num_macros, num_std_cells):
 
 # ======= OPTIMIZATION CODE (edit this part) =======
 def wirelength_attraction_loss(cell_features, pin_features, edge_list, epoch=0, max_epochs=3000):
-    """Optimized wirelength loss - already O(E) which is optimal."""
+    """Optimized wirelength loss"""
     if edge_list.shape[0] == 0:
         return torch.tensor(0.0, requires_grad=True, device=cell_features.device)
 
@@ -289,8 +289,6 @@ def wirelength_attraction_loss(cell_features, pin_features, edge_list, epoch=0, 
 
 def find_nearby_pairs_kdtree(positions, widths, heights, search_radius_multiplier=3.0):
     """Use scipy's cKDTree to find nearby cell pairs efficiently.
-    
-    This is O(N log N) instead of O(N²)!
     
     Args:
         positions: [N, 2] tensor of cell centers
@@ -331,8 +329,6 @@ def find_nearby_pairs_kdtree(positions, widths, heights, search_radius_multiplie
 
 def overlap_repulsion_loss_kdtree(cell_features, pin_features, edge_list, epoch=0, max_epochs=3000):
     """Fast overlap loss using KD-tree spatial indexing.
-    
-    Complexity: O(N log N) instead of O(N²)
     
     For 2000 cells:
     - Old way: 2000² = 4M comparisons
@@ -472,8 +468,6 @@ def train_placement(
     early_stop_patience=200,
 ):
     """Optimized training with KD-tree spatial indexing.
-    
-    Key optimization: O(N log N) overlap detection instead of O(N²)
     """
     cell_features = cell_features.clone()
     initial_cell_features = cell_features.clone()
