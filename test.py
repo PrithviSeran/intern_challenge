@@ -94,7 +94,7 @@ def run_placement_test(
         pin_features,
         edge_list,
         verbose=True,
-        num_epochs = 15500,
+        num_epochs = 8500,
         log_interval=200,
         lambda_wirelength=7,
         lambda_overlap=80.0

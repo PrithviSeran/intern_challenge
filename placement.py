@@ -43,6 +43,10 @@ from enum import IntEnum
 
 import torch
 import torch.optim as optim
+from scipy.spatial import cKDTree
+import numpy as np
+from torch.utils.checkpoint import checkpoint
+
 
 
 # Feature index enums for cleaner code access
@@ -245,35 +249,17 @@ def generate_placement_input(num_macros, num_std_cells):
     return cell_features, pin_features, edge_list
 
 # ======= OPTIMIZATION CODE (edit this part) =======
-
-def wirelength_attraction_loss(cell_features, pin_features, edge_list):
-    """Calculate loss based on total wirelength to minimize routing.
-
-    This is a REFERENCE IMPLEMENTATION showing how to write a differentiable loss function.
-
-    The loss computes the Manhattan distance between connected pins and minimizes
-    the total wirelength across all edges.
-
-    Args:
-        cell_features: [N, 6] tensor with [area, num_pins, x, y, width, height]
-        pin_features: [P, 7] tensor with pin information
-        edge_list: [E, 2] tensor with edges
-
-    Returns:
-        Scalar loss value
-    """
+def wirelength_attraction_loss(cell_features, pin_features, edge_list, epoch=0, max_epochs=3000):
+    """Optimized wirelength loss - already O(E) which is optimal."""
     if edge_list.shape[0] == 0:
-        return torch.tensor(0.0, requires_grad=True)
+        return torch.tensor(0.0, requires_grad=True, device=cell_features.device)
 
-    # Update absolute pin positions based on cell positions
-    cell_positions = cell_features[:, 2:4]  # [N, 2]
+    cell_positions = cell_features[:, 2:4]
     cell_indices = pin_features[:, 0].long()
 
-    # Calculate absolute pin positions
     pin_absolute_x = cell_positions[cell_indices, 0] + pin_features[:, 1]
     pin_absolute_y = cell_positions[cell_indices, 1] + pin_features[:, 2]
 
-    # Get source and target pin positions for each edge
     src_pins = edge_list[:, 0].long()
     tgt_pins = edge_list[:, 1].long()
 
@@ -282,238 +268,333 @@ def wirelength_attraction_loss(cell_features, pin_features, edge_list):
     tgt_x = pin_absolute_x[tgt_pins]
     tgt_y = pin_absolute_y[tgt_pins]
 
-    # Calculate smooth approximation of Manhattan distance
-    # Using log-sum-exp approximation for differentiability
-    alpha = 0.02  # Smoothing parameter
+    progress = epoch / max(max_epochs, 1)
+    alpha = 0.05 * (1.0 - 0.8 * progress)
+    
     dx = torch.abs(src_x - tgt_x)
     dy = torch.abs(src_y - tgt_y)
 
-    # Smooth L1 distance with numerical stability
     smooth_manhattan = alpha * torch.logsumexp(
         torch.stack([dx / alpha, dy / alpha], dim=0), dim=0
     )
 
-    # Total wirelength
-    total_wirelength = torch.sum(smooth_manhattan)
+    if progress > 0.7:
+        quadratic_term = 0.1 * (dx ** 2 + dy ** 2)
+        total_wirelength = torch.sum(smooth_manhattan + quadratic_term)
+    else:
+        total_wirelength = torch.sum(smooth_manhattan)
 
-    return total_wirelength / edge_list.shape[0]  # Normalize by number of edges
+    return total_wirelength / edge_list.shape[0]
 
 
-def overlap_repulsion_loss(cell_features, pin_features, edge_list):
-    """Calculate loss to prevent cell overlaps.
-
-    TODO: IMPLEMENT THIS FUNCTION
-
-    This is the main challenge. You need to implement a differentiable loss function
-    that penalizes overlapping cells. The loss should:
-
-    1. Be zero when no cells overlap
-    2. Increase as overlap area increases
-    3. Use only differentiable PyTorch operations (no if statements on tensors)
-    4. Work efficiently with vectorized operations
-
-    HINTS:
-    - Two axis-aligned rectangles overlap if they overlap in BOTH x and y dimensions
-    - For rectangles centered at (x1, y1) and (x2, y2) with widths (w1, w2) and heights (h1, h2):
-      * x-overlap occurs when |x1 - x2| < (w1 + w2) / 2
-      * y-overlap occurs when |y1 - y2| < (h1 + h2) / 2
-    - Use torch.relu() to compute positive overlaps: overlap_x = relu((w1+w2)/2 - |x1-x2|)
-    - Overlap area = overlap_x * overlap_y
-    - Consider all pairs of cells: use broadcasting with unsqueeze
-    - Use torch.triu() to avoid counting each pair twice (only consider i < j)
-    - Normalize the loss appropriately (by number of pairs or total area)
-
-    RECOMMENDED APPROACH:
-    1. Extract positions, widths, heights from cell_features
-    2. Compute all pairwise distances using broadcasting:
-       positions_i = positions.unsqueeze(1)  # [N, 1, 2]
-       positions_j = positions.unsqueeze(0)  # [1, N, 2]
-       distances = positions_i - positions_j  # [N, N, 2]
-    3. Calculate minimum separation distances for each pair
-    4. Use relu to get positive overlap amounts
-    5. Multiply overlaps in x and y to get overlap areas
-    6. Mask to only consider upper triangle (i < j)
-    7. Sum and normalize
-
+def find_nearby_pairs_kdtree(positions, widths, heights, search_radius_multiplier=3.0):
+    """Use scipy's cKDTree to find nearby cell pairs efficiently.
+    
+    This is O(N log N) instead of O(N²)!
+    
     Args:
-        cell_features: [N, 6] tensor with [area, num_pins, x, y, width, height]
-        pin_features: [P, 7] tensor with pin information (not used here)
-        edge_list: [E, 2] tensor with edges (not used here)
-
+        positions: [N, 2] tensor of cell centers
+        widths: [N] tensor of cell widths
+        heights: [N] tensor of cell heights
+        search_radius_multiplier: How many cell-widths away to search
+        
     Returns:
-        Scalar loss value (should be 0 when no overlaps exist)
+        List of (i, j) pairs where i < j and cells might overlap
     """
+    N = positions.shape[0]
+    
+    # Convert to numpy for scipy
+    pos_np = positions.detach().cpu().numpy()
+    w_np = widths.detach().cpu().numpy()
+    h_np = heights.detach().cpu().numpy()
+    
+    # Build KD-tree (O(N log N))
+    tree = cKDTree(pos_np)
+    
+    # For each cell, find neighbors within search radius
+    # Search radius = cell's own size * multiplier
+    pairs = []
+    max_dim = np.maximum(w_np, h_np)
+    search_radii = max_dim * search_radius_multiplier
+    
+    for i in range(N):
+        # Query tree for neighbors (O(log N) per query)
+        indices = tree.query_ball_point(pos_np[i], search_radii[i])
+        
+        # Only keep pairs where j > i to avoid duplicates
+        for j in indices:
+            if j > i:
+                pairs.append((i, j))
+    
+    return pairs
 
-    import torch
+
+def overlap_repulsion_loss_kdtree(cell_features, pin_features, edge_list, epoch=0, max_epochs=3000):
+    """Fast overlap loss using KD-tree spatial indexing.
     
+    Complexity: O(N log N) instead of O(N²)
+    
+    For 2000 cells:
+    - Old way: 2000² = 4M comparisons
+    - New way: ~2000 * log(2000) * k ≈ 20k comparisons (k = avg neighbors ≈ 10)
+    - Speedup: ~200x
+    """
     eps = 1e-8
-    
     positions = cell_features[:, 2:4]
     widths = cell_features[:, 4]
     heights = cell_features[:, 5]
     areas = cell_features[:, 0]
-    
     N = positions.size(0)
+    device = cell_features.device
     
     if N < 2:
-        return torch.tensor(0.0, device=cell_features.device, requires_grad=True)
+        return torch.tensor(0.0, device=device, requires_grad=True)
     
-    # Broadcast positions for pairwise comparisons
-    pos_i = positions.unsqueeze(1)  # [N, 1, 2]
-    pos_j = positions.unsqueeze(0)  # [1, N, 2]
-    delta = (pos_i - pos_j).abs()   # [N, N, 2]
+    progress = epoch / max(max_epochs, 1)
     
-    # Broadcast dimensions
-    w_i = widths.unsqueeze(1)
-    w_j = widths.unsqueeze(0)
-    h_i = heights.unsqueeze(1)
-    h_j = heights.unsqueeze(0)
+    # === FIND NEARBY PAIRS USING KD-TREE ===
+    # Only check cells that are actually close to each other
+    # This is the KEY optimization: O(N log N) vs O(N²)
     
-    area_i = areas.unsqueeze(1)
-    area_j = areas.unsqueeze(0)
+    pairs = find_nearby_pairs_kdtree(positions, widths, heights, search_radius_multiplier=3.0)
+    
+    if len(pairs) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+    
+    # Convert pairs to tensors
+    pairs_tensor = torch.tensor(pairs, device=device, dtype=torch.long)
+    i_indices = pairs_tensor[:, 0]
+    j_indices = pairs_tensor[:, 1]
+    
+    # === COMPUTE OVERLAPS ONLY FOR NEARBY PAIRS ===
+    # Instead of [N, N] matrices, we have [K] vectors where K << N²
+    
+    pos_i = positions[i_indices]  # [K, 2]
+    pos_j = positions[j_indices]  # [K, 2]
+    delta = (pos_i - pos_j).abs()  # [K, 2]
+    
+    w_i = widths[i_indices]   # [K]
+    w_j = widths[j_indices]   # [K]
+    h_i = heights[i_indices]  # [K]
+    h_j = heights[j_indices]  # [K]
+    area_i = areas[i_indices] # [K]
+    area_j = areas[j_indices] # [K]
+    
     min_area = torch.minimum(area_i, area_j)
     
-    # Only penalize when cells actually overlap, not when they're close
-    overlap_x = torch.relu((w_i + w_j) / 2.0 - delta[:, :, 0])
-    overlap_y = torch.relu((h_i + h_j) / 2.0 - delta[:, :, 1])
+    # Compute overlaps
+    overlap_x = torch.relu((w_i + w_j) / 2.0 - delta[:, 0])
+    overlap_y = torch.relu((h_i + h_j) / 2.0 - delta[:, 1])
     overlap_area = overlap_x * overlap_y
     
     # Normalize by smaller cell area
     relative_overlap = overlap_area / (min_area + eps)
     
-    # Only consider upper triangle to avoid double counting
-    mask = torch.triu(torch.ones(N, N, device=cell_features.device), diagonal=1)
+    # Count actual overlaps
+    has_overlap = overlap_area > eps
+    overlap_count = has_overlap.float().sum()
     
-    overlap_count = ((overlap_area * mask) > eps).float().sum()
-    
-    # Smooth indicator for overlaps (differentiable counting)
-    k = 50.0  # Moderate steepness for stability
-    overlap_indicator = torch.sigmoid(k * relative_overlap)
-    
-    # Different strategies based on number of overlaps
     if overlap_count == 0:
-        # No overlaps - return zero loss
-        return torch.tensor(0.0, device=cell_features.device, requires_grad=True)
+        return torch.tensor(0.0, device=device, requires_grad=True)
     
-    elif overlap_count <= 3:
-        # Very few overlaps: aggressive penalty to eliminate them
-        # Use high power to strongly penalize even small overlaps
-        penalty = (relative_overlap ** 1.5 * mask).sum() * 1000.0
-        count_penalty = (overlap_indicator * mask).sum() * 500.0
-        total_loss = penalty + count_penalty
+    # === PHASE-BASED PENALTIES (simplified for speed) ===
+    
+    if progress < 0.3:
+        base_mult = 80.0
+        exponent = 1.0
+        k_sigmoid = 15.0
+        max_weight = 20.0
+        count_weight = 0.3
         
-    elif overlap_count <= 10:
-        # Few overlaps: strong penalty
-        penalty = (relative_overlap ** 1.5 * mask).sum() * 500.0
-        count_penalty = (overlap_indicator * mask).sum() * 200.0
-        total_loss = penalty + count_penalty
-        
-    elif overlap_count <= 30:
-        # Moderate overlaps: balanced approach
-        penalty = (relative_overlap ** 2 * mask).sum() * 200.0
-        count_penalty = (overlap_indicator * mask).sum() * 100.0
-        total_loss = penalty + count_penalty
+    elif progress < 0.7:
+        phase_progress = (progress - 0.3) / 0.4
+        base_mult = 80.0 + 420.0 * phase_progress
+        exponent = 1.0 + 0.8 * phase_progress
+        k_sigmoid = 15.0 + 35.0 * phase_progress
+        max_weight = 20.0 + 130.0 * phase_progress
+        count_weight = 0.3 + 0.4 * phase_progress
         
     else:
-        # Many overlaps: gentler penalty (let system organize)
-        # Use quadratic to provide smooth gradients
-        penalty = (relative_overlap ** 2 * mask).sum() * 100.0
-        count_penalty = (overlap_indicator * mask).sum() * 50.0
-        total_loss = penalty + count_penalty
+        phase_progress = (progress - 0.7) / 0.3
+        base_mult = 500.0 + 2000.0 * phase_progress
+        exponent = 1.8 + 0.7 * phase_progress
+        k_sigmoid = 50.0 + 100.0 * phase_progress
+        max_weight = 150.0 + 600.0 * phase_progress
+        count_weight = 0.7 + 0.6 * phase_progress
+    
+    # === COMPUTE PENALTIES (vectorized over K pairs) ===
+    
+    # 1. Area penalty
+    area_penalty = (relative_overlap ** exponent).sum()
+    
+    # 2. Count penalty
+    overlap_indicator = torch.sigmoid(k_sigmoid * relative_overlap)
+    count_penalty = overlap_indicator.sum()
+    
+    # 3. Max overlap
+    max_overlap = relative_overlap.max()
+    
+    # 4. Severe overlaps (late phase only)
+    if progress > 0.5:
+        severe_threshold = 0.1
+        severe_overlaps = torch.relu(relative_overlap - severe_threshold)
+        severe_penalty = (severe_overlaps ** 3).sum()
+    else:
+        severe_penalty = torch.tensor(0.0, device=device)
+    
+    # === ADAPTIVE AGGRESSION ===
+    norm_count = torch.clamp(overlap_count / 40.0, 0.0, 1.0)
+    aggression_factor = 1.0 + 2.0 / (norm_count + 0.15)
+    
+    # === COMBINE PENALTIES ===
+    total_loss = base_mult * (
+        area_penalty * aggression_factor +
+        count_penalty * count_weight * aggression_factor +
+        max_overlap * max_weight * aggression_factor +
+        severe_penalty * 100.0 * (1.0 + progress * 2.0)
+    )
     
     return total_loss
-
 
 
 def train_placement(
     cell_features,
     pin_features,
     edge_list,
-    num_epochs=1000,
-    lr=0.01,
+    num_epochs=3000,
+    lr=0.02,
     lambda_wirelength=1.0,
-    lambda_overlap=10.0,
+    lambda_overlap=12.0,
     verbose=True,
     log_interval=100,
+    use_scheduler=True,
+    early_stop_threshold=1e-6,
+    early_stop_patience=200,
 ):
-    """Train the placement optimization using gradient descent.
-
-    Args:
-        cell_features: [N, 6] tensor with cell properties
-        pin_features: [P, 7] tensor with pin properties
-        edge_list: [E, 2] tensor with edge connectivity
-        num_epochs: Number of optimization iterations
-        lr: Learning rate for Adam optimizer
-        lambda_wirelength: Weight for wirelength loss
-        lambda_overlap: Weight for overlap loss
-        verbose: Whether to print progress
-        log_interval: How often to print progress
-
-    Returns:
-        Dictionary with:
-            - final_cell_features: Optimized cell positions
-            - initial_cell_features: Original cell positions (for comparison)
-            - loss_history: Loss values over time
+    """Optimized training with KD-tree spatial indexing.
+    
+    Key optimization: O(N log N) overlap detection instead of O(N²)
     """
-    # Clone features and create learnable positions
     cell_features = cell_features.clone()
     initial_cell_features = cell_features.clone()
 
-    # Make only cell positions require gradients
     cell_positions = cell_features[:, 2:4].clone().detach()
     cell_positions.requires_grad_(True)
 
-    # Create optimizer
-    optimizer = optim.Adam([cell_positions], lr=lr)
+    N = cell_features.size(0)
+    if N > 1000:
+        effective_lr = lr * 0.8
+        weight_decay = 1e-4
+    else:
+        effective_lr = lr
+        weight_decay = 1e-5
+    
+    optimizer = optim.AdamW([cell_positions], lr=effective_lr, weight_decay=weight_decay)
+    
+    if use_scheduler:
+        warmup_epochs = int(0.05 * num_epochs)
+        
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            else:
+                progress = (epoch - warmup_epochs) / (num_epochs - warmup_epochs)
+                return 0.5 * (1.0 + torch.cos(torch.tensor(3.14159 * progress)))
+        
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    else:
+        scheduler = None
 
-    # Track loss history
     loss_history = {
         "total_loss": [],
         "wirelength_loss": [],
         "overlap_loss": [],
+        "learning_rate": [],
     }
+    
+    overlap_zero_epochs = 0
 
-    # Training loop
     for epoch in range(num_epochs):
         optimizer.zero_grad()
 
-        # Create cell_features with current positions
         cell_features_current = cell_features.clone()
         cell_features_current[:, 2:4] = cell_positions
 
         # Calculate losses
         wl_loss = wirelength_attraction_loss(
-            cell_features_current, pin_features, edge_list
+            cell_features_current, pin_features, edge_list, 
+            epoch=epoch, max_epochs=num_epochs
         )
-        overlap_loss = overlap_repulsion_loss(
-            cell_features_current, pin_features, edge_list
+        
+        overlap_loss = overlap_repulsion_loss_kdtree(
+            cell_features_current, pin_features, edge_list, 
+            epoch=epoch, max_epochs=num_epochs
         )
+        
+        # Adaptive loss weighting
+        progress = epoch / num_epochs
+        if progress < 0.5:
+            adaptive_overlap_weight = lambda_overlap * (1.0 + progress)
+            adaptive_wirelength_weight = lambda_wirelength * (0.5 + 0.5 * progress)
+        else:
+            adaptive_overlap_weight = lambda_overlap * 1.5
+            adaptive_wirelength_weight = lambda_wirelength
 
-        # Combined loss
-        total_loss = lambda_wirelength * wl_loss + lambda_overlap * overlap_loss
+        total_loss = (adaptive_wirelength_weight * wl_loss + 
+                     adaptive_overlap_weight * overlap_loss)
 
-        # Backward pass
         total_loss.backward()
 
-        # Gradient clipping to prevent extreme updates
-        torch.nn.utils.clip_grad_norm_([cell_positions], max_norm=5.0)
+        # Adaptive gradient clipping
+        if progress < 0.3:
+            max_grad_norm = 10.0
+        elif progress < 0.7:
+            max_grad_norm = 5.0
+        else:
+            max_grad_norm = 2.0
+        
+        torch.nn.utils.clip_grad_norm_([cell_positions], max_norm=max_grad_norm)
 
-        # Update positions
         optimizer.step()
+        
+        if scheduler is not None:
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+        else:
+            current_lr = effective_lr
 
-        # Record losses
         loss_history["total_loss"].append(total_loss.item())
         loss_history["wirelength_loss"].append(wl_loss.item())
         loss_history["overlap_loss"].append(overlap_loss.item())
+        loss_history["learning_rate"].append(current_lr)
 
+        # Early stopping
+        current_overlap = overlap_loss.item()
+        
+        if current_overlap < early_stop_threshold:
+            overlap_zero_epochs += 1
+            if overlap_zero_epochs >= early_stop_patience:
+                if verbose:
+                    print(f"\n✓ Early stopping at epoch {epoch}: No overlaps for {overlap_zero_epochs} epochs!")
+                    print(f"  Final Overlap Loss: {current_overlap:.8f}")
+                    print(f"  Final Wirelength Loss: {wl_loss.item():.6f}")
+                break
+        else:
+            overlap_zero_epochs = 0
+        
         # Log progress
         if verbose and (epoch % log_interval == 0 or epoch == num_epochs - 1):
-            print(f"Epoch {epoch}/{num_epochs}:")
+            if epoch == 0:
+                print(f"Training with KD-tree spatial indexing (O(N log N))")
+                print(f"N = {N} cells\n")
+            
+            print(f"Epoch {epoch}/{num_epochs} (LR: {current_lr:.6f}):")
             print(f"  Total Loss: {total_loss.item():.6f}")
             print(f"  Wirelength Loss: {wl_loss.item():.6f}")
-            print(f"  Overlap Loss: {overlap_loss.item():.6f}")
+            print(f"  Overlap Loss: {current_overlap:.6f}")
+            if overlap_zero_epochs > 0:
+                print(f"  ✓ Zero overlaps for {overlap_zero_epochs} consecutive epochs")
 
-    # Create final cell features
     final_cell_features = cell_features.clone()
     final_cell_features[:, 2:4] = cell_positions.detach()
 
@@ -521,9 +602,11 @@ def train_placement(
         "final_cell_features": final_cell_features,
         "initial_cell_features": initial_cell_features,
         "loss_history": loss_history,
+        "converged_epoch": epoch,
+        "final_overlap_loss": overlap_loss.item(),
+        "final_wirelength_loss": wl_loss.item(),
     }
-
-
+    
 # ======= FINAL EVALUATION CODE (Don't edit this part) =======
 
 def calculate_overlap_metrics(cell_features):
@@ -824,7 +907,7 @@ def main():
         pin_features,
         edge_list,
         verbose=True,
-        num_epochs = 15500,
+        num_epochs = 10500,
         log_interval=200,
         lambda_wirelength=7,
         lambda_overlap=80.0
